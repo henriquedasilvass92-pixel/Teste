@@ -51,7 +51,8 @@ local connections, coinPool, itemPool, playerPool = {}, {}, {}, {}
 local running, rescanRequested = true, false
 local OrionLib, orionGui, orionMain, orionScale
 local FlyToggle, GunToggle, CoinLabel, FlightLabel, GunLabel
-local TeleportLabel, LocationsLabel, LocationDropdown
+local TeleportLabel, LocationsLabel, LocationDropdown, LobbyLabel
+local ViewLabel, ViewPlayerDropdown, TeleportPlayerDropdown
 local menuVisible = true
 local stopFlight, unload
 local status, flightStatus = {Text = "Procurando moedas..."}, {Text = "Voo desligado"}
@@ -852,217 +853,375 @@ local function render()
     end
 end
 
--- TELEPORTE: destinos encontrados no Workspace atual, sem coordenadas fixas.
+-- TELEPORTE: so publica pontos com piso e espaco encontrados neste cliente.
 local teleportStatus = {Text = "Escolha um jogador ou local para teleportar"}
 local teleportPlaces, teleportKinds, selectedPlace = {}, {}, "Selecione um local"
 local teleportPlacesDirty, placeElapsed, placeSignature = true, 0, nil
-local SPAWN_GROUPS = {spawns = true, spawnpoints = true, playerspawns = true, spawnlocations = true}
+local groundPoint, placePoint
+local lobbyRemembered
+-- Referencia historica do lobby do MM2; nunca e usada sem validar o piso atual.
+local MM2_LOBBY_REFERENCE = Vector3.new(-108.5, 145, 0.6)
+local SPAWN_GROUPS = {spawns=true, spawnpoints=true, playerspawns=true, spawnlocations=true}
+local SPAWN_NAMES = {spawn=true, spawnpoint=true, lobbyspawn=true, lobbyspawnpoint=true, spawnlocation=true}
+local LOBBY_NAMES = {lobby=true, mainlobby=true, lobbymap=true, lobbyarea=true}
 local PLACE_NAMES = {
-    mapvoting = {"Voting", "Area de votacao"}, voting = {"Voting", "Area de votacao"},
-    votingarea = {"Voting", "Area de votacao"}, mapvote = {"Voting", "Area de votacao"},
-    votacao = {"Voting", "Area de votacao"}, votingroom = {"Voting", "Area de votacao"},
-    shop = {"Shop", "Loja"}, weaponshop = {"Shop", "Loja"}, loja = {"Shop", "Loja"},
-    kitchen = {"Room", "Cozinha"}, cozinha = {"Room", "Cozinha"},
-    garage = {"Room", "Garagem"}, garagem = {"Room", "Garagem"},
-    vault = {"Room", "Cofre"}, cofre = {"Room", "Cofre"},
-    courtyard = {"Room", "Patio"}, patio = {"Room", "Patio"},
-    pool = {"Room", "Piscina"}, piscina = {"Room", "Piscina"},
-    basement = {"Room", "Porao"}, attic = {"Room", "Sotao"},
-    warehouse = {"Room", "Armazem"}, office = {"Room", "Escritorio"},
+    mapvoting={"Voting","Area de votacao"}, voting={"Voting","Area de votacao"},
+    votingarea={"Voting","Area de votacao"}, mapvote={"Voting","Area de votacao"},
+    votacao={"Voting","Area de votacao"}, votingroom={"Voting","Area de votacao"},
+    shop={"Shop","Loja"}, weaponshop={"Shop","Loja"}, loja={"Shop","Loja"},
+    kitchen={"Room","Cozinha"}, cozinha={"Room","Cozinha"},
+    garage={"Room","Garagem"}, garagem={"Room","Garagem"}, vault={"Room","Cofre"},
+    cofre={"Room","Cofre"}, courtyard={"Room","Patio"}, patio={"Room","Patio"},
+    pool={"Room","Piscina"}, piscina={"Room","Piscina"}, basement={"Room","Porao"},
+    attic={"Room","Sotao"}, warehouse={"Room","Armazem"}, office={"Room","Escritorio"},
 }
 local function validPlaceObject(object)
     if not object or not isPhysical(object) or not object:IsDescendantOf(workspace) then return false end
-    local current = object
-    while current and current ~= workspace do
+    local current=object
+    while current and current~=workspace do
         if current:IsA("Tool") or current:IsA("Accessory")
             or (current:IsA("Model") and current:FindFirstChildOfClass("Humanoid")) then return false end
-        current = current.Parent
+        current=current.Parent
     end
     return true
 end
-local function inside(object, ancestor)
-    return ancestor and (object == ancestor or object:IsDescendantOf(ancestor))
+local function inside(object,ancestor)
+    return ancestor and (object==ancestor or object:IsDescendantOf(ancestor))
 end
-local function inSpawnGroup(part, area)
-    if part:IsA("SpawnLocation") then return true end
-    local current = part.Parent
-    while current and current ~= workspace do
+local function inSpawnGroup(part,area)
+    if part:IsA("SpawnLocation") or SPAWN_NAMES[normalized(part.Name)] then return true end
+    local current=part.Parent
+    while current and current~=workspace do
         if SPAWN_GROUPS[normalized(current.Name)] then return true end
-        if current == area then break end
-        current = current.Parent
+        if current==area then break end
+        current=current.Parent
     end
     return false
 end
-local function refreshTeleportPlaces()
-    local objects = workspace:GetDescendants()
-    local lobby, mapRoot, bestMapScore = nil, nil, 0
-    local scores = {}
-    for _, object in ipairs(objects) do
-        if validPlaceObject(object) and normalized(object.Name) == "lobby" then
-            if not lobby or #object:GetFullName() < #lobby:GetFullName() then lobby = object end
-        end
-    end
-    for _, object in ipairs(objects) do
-        local name, parent = normalized(object.Name), object.Parent
-        if (name == "coincontainer" or SPAWN_GROUPS[name]) and validPlaceObject(parent)
-            and not inside(parent, lobby) then
-            scores[parent] = (scores[parent] or 0) + (name == "coincontainer" and 3 or 1)
-        end
-    end
-    for candidate, score in pairs(scores) do
-        if score > bestMapScore or (score == bestMapScore and mapRoot
-            and candidate:GetFullName() < mapRoot:GetFullName()) then mapRoot, bestMapScore = candidate, score end
-    end
-    if not mapRoot then
-        for _, object in ipairs(workspace:GetChildren()) do
-            local name = normalized(object.Name)
-            if (name == "normal" or name == "map" or name == "currentmap")
-                and validPlaceObject(object) and not inside(object, lobby) then mapRoot = object; break end
-        end
-    end
-    local places, kinds, seen, labels = {}, {}, {}, {}
-    local function add(object, kind, title)
-        if seen[object] or not validPlaceObject(object) then return end
-        local base = title .. " (" .. object.Name .. ")"
-        local label, suffix = base, 1
-        while places[label] do suffix = suffix + 1; label = base .. " #" .. suffix end
-        places[label] = {root = object, kind = kind, label = label}
-        if not kinds[kind] then kinds[kind] = places[label] end
-        seen[object] = true
-        table.insert(labels, label)
-    end
-    if lobby then add(lobby, "Lobby", "Lobby") end
-    if mapRoot then add(mapRoot, "Map", "Mapa atual") end
-    local recognized = {}
-    for _, object in ipairs(objects) do
-        if validPlaceObject(object) and (PLACE_NAMES[normalized(object.Name)]
-            or (mapRoot and object:IsA("BasePart") and inside(object, mapRoot) and inSpawnGroup(object, mapRoot))) then
-            table.insert(recognized, {object = object, path = object:GetFullName()})
-        end
-    end
-    table.sort(recognized, function(a, b) return a.path < b.path end)
-    local spawnCount = 0
-    for _, candidate in ipairs(recognized) do
-        local object = candidate.object
-        if #labels >= 60 then break end
-        if validPlaceObject(object) then
-            local named = PLACE_NAMES[normalized(object.Name)]
-            if named then add(object, named[1], named[2]) end
-            if mapRoot and object:IsA("BasePart") and inside(object, mapRoot)
-                and inSpawnGroup(object, mapRoot) and spawnCount < 20 then
-                spawnCount = spawnCount + 1
-                add(object, "Spawn", "Spawn do mapa " .. spawnCount)
-            end
-        end
-    end
-    table.sort(labels)
-    local signatureParts = {}
-    for _, label in ipairs(labels) do table.insert(signatureParts, label .. "=" .. places[label].root:GetFullName()) end
-    local signature = table.concat(signatureParts, "|")
-    teleportPlaces, teleportKinds, teleportPlacesDirty = places, kinds, false
-    if not places[selectedPlace] then selectedPlace = "Selecione um local" end
-    if LocationDropdown and signature ~= placeSignature then
-        local options = {"Selecione um local"}
-        for _, label in ipairs(labels) do table.insert(options, label) end
-        LocationDropdown:Refresh(options, true)
-        LocationDropdown:Set(selectedPlace)
-    end
-    placeSignature = signature
-    if LocationsLabel then LocationsLabel:Set("Locais carregados reconhecidos: " .. #labels) end
+local function characterFilter()
+    local filter={}
+    for _,player in ipairs(Players:GetPlayers()) do if player.Character then table.insert(filter,player.Character) end end
+    return filter
 end
-local function groundPoint(position, hum, root)
-    local parameters = RaycastParams.new()
-    parameters.FilterType = Enum.RaycastFilterType.Exclude
-    parameters.RespectCanCollide, parameters.IgnoreWater = true, true
-    local characters = {}
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player.Character then table.insert(characters, player.Character) end
+groundPoint=function(position,hum,root,scope)
+    local parameters=RaycastParams.new()
+    parameters.FilterType=Enum.RaycastFilterType.Exclude
+    parameters.RespectCanCollide,parameters.IgnoreWater=true,true
+    parameters.FilterDescendantsInstances=characterFilter()
+    local hit=workspace:Raycast(position+Vector3.new(0,4,0),Vector3.new(0,-64,0),parameters)
+    if not hit or hit.Normal.Y<0.7 then return nil end
+    local terrain=hit.Instance:IsA("Terrain")
+    if not terrain and not validPlaceObject(hit.Instance) then return nil end
+    if scope and not inside(hit.Instance,scope) then return nil end
+    if not terrain then
+        local name=normalized(hit.Instance.Name)
+        if name:match("^roof") or name:match("^ceiling") or name:match("^wall") then return nil end
+        if not hit.Instance.CanCollide then return nil end
     end
-    parameters.FilterDescendantsInstances = characters
-    local hit = workspace:Raycast(position + Vector3.new(0, 4, 0), Vector3.new(0, -80, 0), parameters)
-    if not hit or hit.Normal.Y < 0.65
-        or (not hit.Instance:IsA("Terrain") and not validPlaceObject(hit.Instance)) then return nil end
-    local height = (hum.HipHeight or 2) + root.Size.Y / 2
-    if hum.RigType == Enum.HumanoidRigType.R6 then height = height + 2 end
-    return hit.Position + Vector3.new(0, math.max(2, height) + 0.25, 0)
+    local rootSize=root and root.Size or Vector3.new(2,2,1)
+    local height=(hum and hum.HipHeight or 2)+rootSize.Y/2
+    if hum and hum.RigType==Enum.HumanoidRigType.R6 then height=height+2 end
+    height=math.max(2,height)
+    local point=hit.Position+Vector3.new(0,height+0.25,0)
+    local overlap=OverlapParams.new()
+    overlap.FilterType=Enum.RaycastFilterType.Exclude
+    overlap.FilterDescendantsInstances=parameters.FilterDescendantsInstances
+    overlap.RespectCanCollide,overlap.MaxParts=true,32
+    local bodyHeight=math.max(4.5,height*2)
+    local center=hit.Position+Vector3.new(0,bodyHeight/2+0.25,0)
+    for _,part in ipairs(workspace:GetPartBoundsInBox(CFrame.new(center),
+        Vector3.new(rootSize.X+0.5,bodyHeight,rootSize.Z+0.5),overlap)) do
+        if part~=hit.Instance and part.CanCollide then return nil end
+    end
+    return point,hit.Instance
 end
-local function placePoint(entry, hum, root)
-    if not entry or not validPlaceObject(entry.root) then return nil end
-    local candidates = {}
-    local objects = entry.root:IsA("BasePart") and {entry.root} or entry.root:GetDescendants()
-    for _, part in ipairs(objects) do
+local PROBE_OFFSETS={Vector3.new(0,0,0),Vector3.new(3,0,0),Vector3.new(-3,0,0),Vector3.new(0,0,3),Vector3.new(0,0,-3)}
+placePoint=function(entry,hum,root)
+    if not entry then return nil end
+    if entry.root and not validPlaceObject(entry.root) then return nil end
+    if entry.reference then
+        local point,floor=groundPoint(entry.reference,hum,root,entry.root)
+        if point and point.Y>=110 and point.Y<=175 then return point,floor end
+        return nil
+    end
+    if not entry.root then return nil end
+    local candidates={}
+    for _,part in ipairs(entry.root:IsA("BasePart") and {entry.root} or entry.root:GetDescendants()) do
         if part:IsA("BasePart") and validPlaceObject(part) then
-            local score = inSpawnGroup(part, entry.root) and 100 or 0
-            local name = normalized(part.Name)
-            if name == "floor" or name == "ground" or name == "baseplate" then score = score + 60 end
-            if part.CanCollide and part.Size.X >= 4 and part.Size.Z >= 4
-                and part.Size.Y <= math.min(part.Size.X, part.Size.Z) * 0.5 then score = score + 30 end
-            if part.CanCollide or score >= 100 then table.insert(candidates, {part = part, score = score}) end
+            local spawn=inSpawnGroup(part,entry.root)
+            local name=normalized(part.Name)
+            local score=spawn and 200 or 0
+            if name=="floor" or name=="ground" or name=="baseplate" then score=score+100 end
+            local flat=part.CanCollide and part.Size.X>=4 and part.Size.Z>=4
+                and part.Size.Y<=math.min(part.Size.X,part.Size.Z)*0.5
+            if flat then score=score+30 end
+            if spawn or flat or score>=100 then table.insert(candidates,{part=part,score=score,spawn=spawn}) end
         end
     end
-    table.sort(candidates, function(a, b)
-        if a.score ~= b.score then return a.score > b.score end
-        return a.part:GetFullName() < b.part:GetFullName()
+    table.sort(candidates,function(a,b)
+        if a.score~=b.score then return a.score>b.score end
+        return a.part:GetFullName()<b.part:GetFullName()
     end)
-    for index = 1, math.min(16, #candidates) do
-        local candidate = candidates[index].part
-        local point = groundPoint(candidate.Position + Vector3.new(0, candidate.Size.Y / 2, 0), hum, root)
-        if point then return point end
+    local scope=entry.scope or entry.root
+    if entry.kind=="Spawn" then scope=entry.scope end
+    -- Spawns atuais vencem a referencia historica e pisos decorativos.
+    local function probe(candidate)
+        local position=candidate.part.Position+Vector3.new(0,candidate.part.Size.Y/2,0)
+        for _,offset in ipairs(PROBE_OFFSETS) do
+            local point,floor=groundPoint(position+offset,hum,root,scope)
+            if point then return point,floor end
+        end
+    end
+    for index=1,math.min(12,#candidates) do
+        if candidates[index].spawn then
+            local point,floor=probe(candidates[index])
+            if point then return point,floor end
+        end
+    end
+    if entry.kind=="Lobby" then
+        if lobbyRemembered then
+            local point,floor=groundPoint(lobbyRemembered,hum,root,entry.root)
+            if point then return point,floor end
+        end
+        if game.PlaceId==142823291 then
+            local point,floor=groundPoint(MM2_LOBBY_REFERENCE,hum,root,entry.root)
+            if point and point.Y>=110 and point.Y<=175 then return point,floor end
+        end
+    end
+    for index=1,math.min(12,#candidates) do
+        if not candidates[index].spawn then
+            local point,floor=probe(candidates[index])
+            if point then return point,floor end
+        end
     end
     return nil
 end
-local function teleportToPoint(position, label)
-    local _, _, root = freeCharacter()
-    if not root or not running then teleportStatus.Text = "Aguarde um personagem vivo e livre"; return false end
-    pauseFlight()
-    gunJob = nil
-    if CFG.AutoGun then
-        if GunToggle then GunToggle:Set(false) else CFG.AutoGun = false end
+local function refreshTeleportPlaces()
+    local objects=workspace:GetDescendants()
+    local lobby,mapRoot,bestScore=nil,nil,0
+    for _,object in ipairs(objects) do
+        if validPlaceObject(object) and LOBBY_NAMES[normalized(object.Name)] then
+            if not lobby or #object:GetFullName()<#lobby:GetFullName() then lobby=object end
+        end
     end
-    root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = ZERO, ZERO
-    root.CFrame = CFrame.new(position) * root.CFrame.Rotation
-    teleportStatus.Text = "Teleportado: " .. label
+    local scores={}
+    for _,object in ipairs(objects) do
+        local name,parent=normalized(object.Name),object.Parent
+        if (name=="coincontainer" or SPAWN_GROUPS[name]) and validPlaceObject(parent) and not inside(parent,lobby) then
+            scores[parent]=(scores[parent] or 0)+(name=="coincontainer" and 3 or 1)
+        end
+    end
+    for object,score in pairs(scores) do
+        if score>bestScore or (score==bestScore and mapRoot and object:GetFullName()<mapRoot:GetFullName()) then mapRoot,bestScore=object,score end
+    end
+    if not mapRoot then
+        for _,object in ipairs(workspace:GetChildren()) do
+            local name=normalized(object.Name)
+            if (name=="normal" or name=="map" or name=="currentmap") and validPlaceObject(object) and not inside(object,lobby) then mapRoot=object;break end
+        end
+    end
+    local character=LP.Character
+    local hum=character and character:FindFirstChildOfClass("Humanoid")
+    local root=character and character:FindFirstChild("HumanoidRootPart")
+    local places,kinds,seen,labels={},{},{},{}
+    local function add(object,kind,title,scope,reference)
+        if object and (seen[object] or not validPlaceObject(object)) then return end
+        local base=title..(object and (" ("..object.Name..")") or "")
+        local label,suffix=base,1
+        while places[label] do suffix=suffix+1;label=base.." #"..suffix end
+        local entry={root=object,kind=kind,label=label,scope=scope,reference=reference}
+        local point,floor=placePoint(entry,hum,root)
+        if not point then return end -- Sem piso/espaco, a opcao nao entra na lista.
+        entry.point,entry.floor=point,floor
+        places[label]=entry
+        if not kinds[kind] then kinds[kind]=entry end
+        if object then seen[object]=true end
+        table.insert(labels,label)
+    end
+    if lobby then add(lobby,"Lobby","Lobby",lobby)
+    elseif game.PlaceId==142823291 then add(nil,"Lobby","Lobby MM2 - piso verificado",nil,MM2_LOBBY_REFERENCE) end
+    if mapRoot then add(mapRoot,"Map","Mapa atual",mapRoot) end
+    local recognized={}
+    for _,object in ipairs(objects) do
+        if validPlaceObject(object) and (PLACE_NAMES[normalized(object.Name)]
+            or (mapRoot and object:IsA("BasePart") and inside(object,mapRoot) and inSpawnGroup(object,mapRoot))) then
+            table.insert(recognized,{object=object,path=object:GetFullName()})
+        end
+    end
+    table.sort(recognized,function(a,b)return a.path<b.path end)
+    local spawns=0
+    for _,candidate in ipairs(recognized) do
+        if #labels>=40 then break end
+        local object=candidate.object
+        local named=PLACE_NAMES[normalized(object.Name)]
+        if named then
+            local scope=inside(object,lobby) and lobby or (inside(object,mapRoot) and mapRoot or object)
+            add(object,named[1],named[2],scope)
+        end
+        if mapRoot and object:IsA("BasePart") and inside(object,mapRoot) and inSpawnGroup(object,mapRoot) and spawns<20 then
+            spawns=spawns+1;add(object,"Spawn","Spawn do mapa "..spawns,mapRoot)
+        end
+    end
+    table.sort(labels)
+    local signatureParts={}
+    for _,label in ipairs(labels) do
+        local entry=places[label]
+        table.insert(signatureParts,label.."="..(entry.root and entry.root:GetFullName() or "MM2LobbyReference"))
+    end
+    local signature=table.concat(signatureParts,"|")
+    teleportPlaces,teleportKinds,teleportPlacesDirty=places,kinds,false
+    if not places[selectedPlace] then selectedPlace="Selecione um local" end
+    if LocationDropdown and signature~=placeSignature then
+        local options={"Selecione um local"}
+        for _,label in ipairs(labels) do table.insert(options,label) end
+        LocationDropdown:Refresh(options,true);LocationDropdown:Set(selectedPlace)
+    end
+    placeSignature=signature
+    if LocationsLabel then LocationsLabel:Set("Pontos com piso e espaco verificados: "..#labels) end
+    if LobbyLabel then
+        local entry=kinds.Lobby
+        if entry then
+            local p=entry.point
+            LobbyLabel:Set(string.format("Lobby: %.1f, %.1f, %.1f",p.X,p.Y,p.Z))
+        else LobbyLabel:Set("Lobby: aguardando piso/spawn carregado") end
+    end
+end
+local function teleportToPoint(position,label)
+    local _,_,root=freeCharacter()
+    if not root or not running then teleportStatus.Text="Aguarde um personagem vivo e livre";return false end
+    pauseFlight();gunJob=nil
+    if CFG.AutoGun then if GunToggle then GunToggle:Set(false) else CFG.AutoGun=false end end
+    root.AssemblyLinearVelocity,root.AssemblyAngularVelocity=ZERO,ZERO
+    root.CFrame=CFrame.new(position)*root.CFrame.Rotation
+    teleportStatus.Text="Teleportado: "..label
     return true
 end
 local function teleportToPlace(entry)
-    local _, hum, root = freeCharacter()
-    if not root then teleportStatus.Text = "Aguarde um personagem vivo e livre"; return end
-    if not entry or not validPlaceObject(entry.root) then
-        teleportStatus.Text = "Esse local nao esta carregado no mapa atual"; return
+    local _,hum,root=freeCharacter()
+    if not root then teleportStatus.Text="Aguarde um personagem vivo e livre";return end
+    if not entry or (entry.root and not validPlaceObject(entry.root)) then
+        teleportStatus.Text="Esse local nao esta carregado ou nao passou na verificacao";return
     end
-    local point = placePoint(entry, hum, root)
-    if not point then teleportStatus.Text = "Nao foi encontrado piso carregado nesse local"; return end
-    teleportToPoint(point, entry.label)
+    local point=placePoint(entry,hum,root)
+    if not point then teleportStatus.Text="Piso ou espaco indisponivel; atualize os locais";teleportPlacesDirty=true;return end
+    if teleportToPoint(point,entry.label) and entry.kind=="Lobby" then lobbyRemembered=point end
 end
 local function teleportToKind(kind)
-    refreshTeleportPlaces()
-    teleportToPlace(teleportKinds[kind])
+    refreshTeleportPlaces();teleportToPlace(teleportKinds[kind])
+end
+local function livingPlayer(player)
+    if not player or player==LP then return nil end
+    local char=player.Character
+    if not char or not char:IsDescendantOf(workspace) then return nil end
+    local hum=char and char:FindFirstChildOfClass("Humanoid")
+    local root=char and char:FindFirstChild("HumanoidRootPart")
+    if hum and hum.Health>0 and root and root:IsA("BasePart") then return hum,root,char end
+end
+local function rolePlayer(role)
+    local origin=originPosition(workspace.CurrentCamera) or ZERO
+    local chosen,distance=nil,math.huge
+    for _,player in ipairs(Players:GetPlayers()) do
+        local _,root=livingPlayer(player)
+        if root and getRole(player)==role then
+            local d=(root.Position-origin).Magnitude
+            if d<distance then chosen,distance=player,d end
+        end
+    end
+    return chosen
+end
+local function teleportToPlayer(player,title)
+    local _,hum,root=freeCharacter()
+    if not root then teleportStatus.Text="Aguarde um personagem vivo e livre";return end
+    local _,target=livingPlayer(player)
+    if not target then teleportStatus.Text="Jogador sem personagem vivo carregado";return end
+    for _,offset in ipairs({target.CFrame.LookVector*-4,Vector3.new(4,0,0),Vector3.new(-4,0,0)}) do
+        local point=groundPoint(target.Position+offset,hum,root)
+        if point then teleportToPoint(point,(title or "Jogador").." - "..player.Name);return end
+    end
+    teleportStatus.Text="Sem ponto livre perto de "..player.Name
 end
 local function teleportToRole(role)
-    local _, hum, root = freeCharacter()
-    if not root then teleportStatus.Text = "Aguarde um personagem vivo e livre"; return end
-    local chosen, chosenRoot, distance = nil, nil, math.huge
-    for _, player in ipairs(Players:GetPlayers()) do
-        local char = player.Character
-        local target = char and char:FindFirstChild("HumanoidRootPart")
-        if player ~= LP and target and target:IsA("BasePart") and getRole(player) == role then
-            local current = (target.Position - root.Position).Magnitude
-            if current < distance then chosen, chosenRoot, distance = player, target, current end
+    local player=rolePlayer(role)
+    if not player then teleportStatus.Text=role=="SHERIFF" and "Xerife nao identificado no cliente" or "Murderer nao identificado no cliente";return end
+    teleportToPlayer(player,role=="SHERIFF" and "Xerife" or "Murderer")
+end
+
+-- VIEW: CameraSubject segue o Humanoid; nao move o personagem local.
+local viewState
+local viewStatus={Text="Visualizacao desligada"}
+local selectedView,selectedTeleport="Selecione um jogador","Selecione um jogador"
+local roster,rosterSignature={},nil
+local function stopView(restoreOriginal,message)
+    local previous=viewState
+    viewState=nil
+    local own=LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    if previous then
+        for camera,saved in pairs(previous.cameras) do
+            if camera.Parent then
+                local subject=own
+                if restoreOriginal and saved.subject and saved.subject.Parent then
+                    subject=saved.subject
+                    if saved.ownCharacter and inside(saved.subject,saved.ownCharacter) and saved.ownCharacter~=LP.Character then subject=own end
+                end
+                if subject and subject.Parent then camera.CameraSubject=subject end
+                camera.CameraType=restoreOriginal and saved.kind or Enum.CameraType.Custom
+            end
+        end
+    elseif not restoreOriginal and own and workspace.CurrentCamera then
+        workspace.CurrentCamera.CameraType=Enum.CameraType.Custom
+        workspace.CurrentCamera.CameraSubject=own
+    end
+    viewStatus.Text=message or "Camera no seu personagem"
+end
+local function updateView()
+    if not viewState then return end
+    local hum,_,char=livingPlayer(viewState.player)
+    if not hum or char~=viewState.character then stopView(false,"Visualizacao encerrada: alvo morreu ou respawnou");return end
+    local camera=workspace.CurrentCamera
+    if not camera then return end
+    if not viewState.cameras[camera] then
+        viewState.cameras[camera]={subject=camera.CameraSubject,kind=camera.CameraType,ownCharacter=LP.Character}
+    end
+    camera.CameraType=Enum.CameraType.Custom
+    camera.CameraSubject=hum
+end
+local function viewPlayer(player)
+    if not running then return end
+    local hum,_,char=livingPlayer(player)
+    if not hum then viewStatus.Text="Jogador sem personagem vivo carregado";return end
+    if not viewState then viewState={cameras={}} end
+    viewState.player,viewState.character=player,char
+    viewStatus.Text="Visualizando: @"..player.Name
+    updateView()
+end
+local function viewRole(role)
+    local player=rolePlayer(role)
+    if player then viewPlayer(player)
+    else viewStatus.Text=role=="SHERIFF" and "Xerife nao identificado no cliente" or "Murderer nao identificado no cliente" end
+end
+local function refreshPlayerList(leaving)
+    local names,nextRoster={},{}
+    for _,player in ipairs(Players:GetPlayers()) do
+        if player~=LP and player~=leaving then names[#names+1]=player.Name;nextRoster[player.Name]=player end
+    end
+    table.sort(names)
+    local signature=table.concat(names,"|")
+    roster=nextRoster
+    if not roster[selectedView] then selectedView="Selecione um jogador" end
+    if not roster[selectedTeleport] then selectedTeleport="Selecione um jogador" end
+    if signature~=rosterSignature then
+        local options={"Selecione um jogador"}
+        for _,name in ipairs(names) do options[#options+1]=name end
+        if ViewPlayerDropdown then
+            local copied={};for i,v in ipairs(options) do copied[i]=v end
+            ViewPlayerDropdown:Refresh(copied,true);ViewPlayerDropdown:Set(selectedView)
+        end
+        if TeleportPlayerDropdown then
+            local copied={};for i,v in ipairs(options) do copied[i]=v end
+            TeleportPlayerDropdown:Refresh(copied,true);TeleportPlayerDropdown:Set(selectedTeleport)
         end
     end
-    if not chosen then
-        teleportStatus.Text = role == "SHERIFF" and "Xerife nao identificado no cliente" or "Murderer nao identificado no cliente"
-        return
-    end
-    local facing = chosenRoot.CFrame.LookVector
-    for _, offset in ipairs({facing * -4, Vector3.new(4, 0, 0), Vector3.new(-4, 0, 0)}) do
-        local point = groundPoint(chosenRoot.Position + offset, hum, root)
-        if point then
-            teleportToPoint(point, (role == "SHERIFF" and "Xerife - " or "Murderer - ") .. chosen.Name)
-            return
-        end
-    end
-    teleportStatus.Text = "Sem piso carregado perto de " .. chosen.Name
+    rosterSignature=signature
 end
 
 -- ORION LIBRARY: versao fixa, carregada do repositorio do autor.
@@ -1071,6 +1230,7 @@ unload = function(destroyWindow)
     running = false
     CFG.AutoFly, CFG.AutoGun, gunJob = false, false, nil
     for _, connection in ipairs(connections) do connection:Disconnect() end
+    stopView(true)
     stopFlight()
     releaseNoclip()
     restoreMovement()
@@ -1163,6 +1323,15 @@ local function setupInterface()
     toggle(playersTab, "Linha ate jogadores", "Tracer")
     toggle(playersTab, "Ignorar meu personagem", "IgnoreLocal")
     playersTab:AddParagraph("Papeis", "Cores inferidas pelas ferramentas visiveis no cliente: Knife em vermelho e Gun/Revolver em azul.")
+    playersTab:AddSection({Name = "View / visualizar"})
+    playersTab:AddButton({Name = "View murderer", Callback = function() viewRole("MURDERER") end})
+    playersTab:AddButton({Name = "View xerife", Callback = function() viewRole("SHERIFF") end})
+    ViewPlayerDropdown = playersTab:AddDropdown({Name = "Jogador para visualizar", Default = "Selecione um jogador",
+        Options = {"Selecione um jogador"}, Save = false, Flag = "MM2_ViewPlayer",
+        Callback = function(name) selectedView = name end})
+    playersTab:AddButton({Name = "View player selecionado", Callback = function() viewPlayer(roster[selectedView]) end})
+    playersTab:AddButton({Name = "Parar view / voltar para mim", Callback = function() stopView(false) end})
+    ViewLabel = playersTab:AddLabel(viewStatus.Text)
     coinsTab:AddSection({Name = "ESP de moedas"})
     CoinLabel = coinsTab:AddLabel("Procurando moedas...")
     toggle(coinsTab, "Coin ESP", "CoinESP")
@@ -1189,18 +1358,24 @@ local function setupInterface()
     teleportTab:AddButton({Name = "Teleportar para o xerife", Callback = function() teleportToRole("SHERIFF") end})
     teleportTab:AddButton({Name = "Teleportar para o murderer", Callback = function() teleportToRole("MURDERER") end})
     teleportTab:AddParagraph("Identificacao", "Procura jogadores vivos com Gun/Revolver ou Knife visivel no cliente. Quem pegou a pistola tambem pode aparecer como portador da arma.")
+    TeleportPlayerDropdown = teleportTab:AddDropdown({Name = "Jogador para teleportar", Default = "Selecione um jogador",
+        Options = {"Selecione um jogador"}, Save = false, Flag = "MM2_TeleportPlayer",
+        Callback = function(name) selectedTeleport = name end})
+    teleportTab:AddButton({Name = "Teleportar para player selecionado", Callback = function() teleportToPlayer(roster[selectedTeleport]) end})
+    teleportTab:AddButton({Name = "Atualizar jogadores", Callback = function() refreshPlayerList() end})
+    refreshPlayerList()
     teleportTab:AddSection({Name = "Locais do jogo"})
     teleportTab:AddButton({Name = "Teleportar para o lobby", Callback = function() teleportToKind("Lobby") end})
     teleportTab:AddButton({Name = "Teleportar para o mapa atual", Callback = function() teleportToKind("Map") end})
-    teleportTab:AddButton({Name = "Teleportar para a area de votacao", Callback = function() teleportToKind("Voting") end})
+    LobbyLabel = teleportTab:AddLabel("Lobby: procurando spawn/piso...")
     LocationsLabel = teleportTab:AddLabel("Procurando locais carregados...")
-    LocationDropdown = teleportTab:AddDropdown({Name = "Locais encontrados no mapa", Default = "Selecione um local",
+    LocationDropdown = teleportTab:AddDropdown({Name = "Locais com piso e espaco verificados", Default = "Selecione um local",
         Options = {"Selecione um local"}, Save = false, Flag = "MM2_TeleportPlace",
         Callback = function(value) selectedPlace = value end})
     teleportTab:AddButton({Name = "Teleportar para o local selecionado", Callback = function() teleportToPlace(teleportPlaces[selectedPlace]) end})
     teleportTab:AddButton({Name = "Atualizar lista de locais", Callback = function() refreshTeleportPlaces() end})
     TeleportLabel = teleportTab:AddLabel(teleportStatus.Text)
-    teleportTab:AddParagraph("Locais carregados", "Lista Lobby, mapa atual, spawns e areas reconhecidas pelos nomes, como votacao, loja e salas. So aparecem objetos presentes neste cliente. O teleporte procura um piso e pausa as buscas automaticas de moedas e pistola.")
+    teleportTab:AddParagraph("Locais carregados", "A lista inclui somente pontos com piso e espaco encontrados no cliente. Lobby usa primeiro os spawns atuais. Votacao, loja e salas aparecem apenas quando passam na verificacao. O teleporte pausa as buscas automaticas.")
     refreshTeleportPlaces()
     worldTab:AddSection({Name = "Ambiente"})
     toggle(worldTab, "Fullbright", "Fullbright", applyFullbright)
@@ -1247,12 +1422,13 @@ local function setupInterface()
 end
 local ready, message = pcall(setupInterface)
 if not ready then unload(true); warn("[MM2 HUB] Orion: " .. tostring(message)); return end
-local lastCoinText, lastFlightText, lastGunText, lastTeleportText
+local lastCoinText, lastFlightText, lastGunText, lastTeleportText, lastViewText
 local function refreshLabels()
     if CoinLabel and status.Text ~= lastCoinText then lastCoinText = status.Text; CoinLabel:Set((status.Text:gsub("\n", " | "))) end
     if FlightLabel and flightStatus.Text ~= lastFlightText then lastFlightText = flightStatus.Text; FlightLabel:Set(flightStatus.Text) end
     if GunLabel and gunStatus.Text ~= lastGunText then lastGunText = gunStatus.Text; GunLabel:Set(gunStatus.Text) end
     if TeleportLabel and teleportStatus.Text ~= lastTeleportText then lastTeleportText = teleportStatus.Text; TeleportLabel:Set(teleportStatus.Text) end
+    if ViewLabel and viewStatus.Text ~= lastViewText then lastViewText = viewStatus.Text; ViewLabel:Set(viewStatus.Text) end
 end
 connect(workspace.DescendantAdded, function(object)
     if running then discover(object) end
@@ -1266,8 +1442,14 @@ connect(CollectionService:GetInstanceAddedSignal("Coin"), function(object)
     if running then track(coinRoot(object)) end
 end)
 connect(CollectionService:GetInstanceRemovedSignal("Coin"), function() rescanRequested = true end)
-connect(Players.PlayerRemoving, removePlayer)
+connect(Players.PlayerAdded, function() refreshPlayerList() end)
+connect(Players.PlayerRemoving, function(player)
+    removePlayer(player)
+    if viewState and viewState.player == player then stopView(false, "Visualizacao encerrada: jogador saiu") end
+    refreshPlayerList(player)
+end)
 connect(LP.CharacterRemoving, function()
+    if viewState then stopView(false) end
     gunJob = nil
     pauseFlight()
     releaseNoclip()
@@ -1305,6 +1487,7 @@ connect(RunService.Heartbeat, function(dt)
         warn("[MM2 HUB] Pistola: " .. tostring(message))
     end
     applyMovement()
+    updateView()
     if CFG.Fullbright then applyFullbright(true) end
     placeElapsed = placeElapsed + elapsedGun
     if teleportPlacesDirty and placeElapsed >= 4 then placeElapsed = 0; refreshTeleportPlaces() end
